@@ -9,7 +9,10 @@ All HTTP input validation and request-level authorization lives in **Form Reques
 - **`rules()` returns validation rules.** Use array-of-rules syntax, not pipe strings.
 - **`authorize()` performs access checks** — membership, ownership, or signature verification. It **fails closed**: return `false` to abort with `403`.
 - **Expose typed accessors** (`installationId(): int`, `state(): string`) that read `validated()`, so the controller pulls clean, typed values.
-- **`prepareForValidation()` normalises input** before rules run (trim, lowercase, decode JSON).
+- **Consume `validated()` / `safe()`, never `$request->all()`.** Only validated keys may reach an Action; raw input is mass-assignment and injection surface.
+- **Extract a non-trivial or reused rule into a `ValidationRule` object** under `App\Rules\` — one invokable `validate()`, the message owned in one place.
+- **Cross-field checks ("these two must agree") live in `after()`** on the Form Request, never smuggled into the controller or Action.
+- **`prepareForValidation()` normalises input** before rules run (trim, lowercase, decode JSON); **`passedValidation()` normalises *after*** rules pass (cast, derive).
 - **`messages()` / `attributes()`** customise error text; keep them only where the default is unclear.
 - **No Form Request for methods with no user input** — pure redirects and OAuth callbacks that own their own framework-supplied params.
 - **Livewire validates in the component** via `rules()` or `#[Validate]`, not in a Form Request.
@@ -408,6 +411,207 @@ final class CreateReportRequest extends FormRequest
 
 Do **not** put authorization or persistence side effects here — it is for input shaping only.
 
+### `passedValidation()` — normalise *after* rules pass
+
+`prepareForValidation()` shapes input *before* the rules see it; `passedValidation()` runs *after* they pass and is the place to derive or canonicalise values you only want to compute once the input is known good. Mutate the validated set with `$this->merge()` (or `replace()`); the new value flows through `validated()` and your typed accessors.
+
+```php
+protected function passedValidation(): void
+{
+    // `orgs` is validated and array-shaped by now — sort + de-dupe once,
+    // so every consumer of validated('orgs') sees the canonical list.
+    $orgs = array_values(array_unique($this->validated('orgs')));
+    sort($orgs);
+
+    $this->merge(['orgs' => $orgs]);
+}
+```
+
+Keep the split sharp: parsing and coercion that the rules depend on → `prepareForValidation()`; derivations that presuppose valid input → `passedValidation()`. Neither method authorizes or persists.
+
+---
+
+## Consume `validated()` / `safe()`, never `$request->all()`
+
+The entire point of a Form Request is that **only validated keys cross into your domain**. `$request->all()` (and `$request->input()`) returns the raw, unvalidated payload — including fields a caller appended that no rule covers. Passing that into an Action or a model is how mass-assignment and injection bugs land. Read `validated()` for the whole clean set, `safe()` when you want its fluent `only()/except()/collect()` helpers, or — preferred here — a **typed accessor** that wraps `validated('key')`.
+
+### ✅ Do — only validated data reaches the Action
+
+```php
+public function store(CreateReportRequest $request, CreateReport $createReport): RedirectResponse
+{
+    $report = $createReport->handle(
+        workspace: $request->workspace(),
+        title: $request->title(),          // wraps validated('title')
+        lookbackDays: $request->lookbackDays(),
+    );
+
+    return to_route('reports.show', $report);
+}
+```
+
+### ❌ Avoid — raw input slips past the rules
+
+```php
+public function store(CreateReportRequest $request, CreateReport $createReport): RedirectResponse
+{
+    // `all()` includes keys no rule validated — e.g. a forged `workspace_id`
+    // or `is_super_admin` — which then flows straight into persistence.
+    $report = $createReport->handle(...$request->all());
+
+    return to_route('reports.show', $report);
+}
+```
+
+`validated()` honours the *current* rule set, so adding a field without a rule for it makes that field unreachable — exactly the safe default.
+
+---
+
+## Extract non-trivial or reused rules into `ValidationRule` objects
+
+A regex or business check that is **non-trivial** (needs a comment to read) or **appears more than once** does not belong inline. Inlined, it gets copy-pasted — and so does its error message — until the copies drift. The org-slug pattern in this guide is pasted at three sites (`CreateReportRequest::rules()`, the `❌ Avoid` pipe-string example, the complete request) each carrying its own `'org/repo'` message string: a textbook DRY violation. Move it into a single `App\Rules` class implementing Laravel's `ValidationRule` contract — one invokable `validate()` signature, with the failure message owned in exactly one place.
+
+### ✅ Do — one `OrgSlug` rule, reused everywhere
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Rules;
+
+use Closure;
+use Illuminate\Contracts\Validation\ValidationRule;
+
+/**
+ * A DIGEST_ORGS entry: a bare `org` (scan all repos) or `org/repo` (scan one).
+ * Owns both the pattern and the failure message so neither is duplicated.
+ */
+final readonly class OrgSlug implements ValidationRule
+{
+    private const string PATTERN = '/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)?$/';
+
+    public function validate(string $attribute, mixed $value, Closure $fail): void
+    {
+        if (! is_string($value) || preg_match(self::PATTERN, $value) !== 1) {
+            $fail('Each org must look like "org" or "org/repo".');
+        }
+    }
+}
+```
+
+Now every request references the rule object instead of repeating the regex and the message:
+
+```php
+public function rules(): array
+{
+    return [
+        'title' => ['required', 'string', 'max:120'],
+        'orgs' => ['required', 'array', 'min:1'],
+        'orgs.*' => ['string', new OrgSlug()],
+        'slack_channel' => ['nullable', 'string', 'starts_with:#'],
+    ];
+}
+```
+
+The `messages()` override for `orgs.*.regex` disappears — the message now lives on the rule, so there is nothing to keep in sync.
+
+### ❌ Avoid — the pattern and its message copied per request
+
+```php
+// CreateReportRequest, UpdateReportRequest, and the Livewire form each carry:
+'orgs.*' => ['string', 'regex:/^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)?$/'],
+// ...plus a parallel messages() entry repeating the same sentence.
+// Three pattern copies, three message copies, three places to fix a bug.
+```
+
+### When to extract — and when not to
+
+- **Extract** when the rule is reused (≥2 call sites) *or* needs context to read — the org slug, a Slack channel grammar, a semver/window constraint, a "no overlap with an existing `DeliveryChannel`" check.
+- **Don't extract** a built-in (`max:120`, `between:1,90`) or a genuinely one-off literal — a named class for a single `in:[...]` is ceremony, not clarity.
+- A rule needing data access (uniqueness, "does this `GithubInstallation` belong to the workspace") may take constructor dependencies — make it `final readonly` and inject a `Contracts\Repositories\*` interface so the rule stays testable without the database.
+- Unit-test the rule object directly: assert it passes valid inputs and calls `$fail` with the one message on invalid ones. The requests that use it then don't re-test the pattern.
+
+---
+
+## Cross-field validation with `after()`
+
+Some constraints span **two or more fields**: `end_date` must be after `start_date`; a `slack_channel` is required only when delivery is `slack`. A single field's rule array cannot see its siblings, so this logic has no home in `rules()` — and because the controller is thin and the Action must receive already-valid input, it cannot live there either. Without a documented seam, readers smuggle it into the controller or Action, which our architecture forbids. The seam is **`after()`**: it returns invokable rules (or closures) that receive the fully-populated `Validator` and may inspect every field at once, attaching errors to whichever field is at fault.
+
+### ✅ Do — agreement checks in `after()`
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Requests\Report;
+
+use Illuminate\Foundation\Http\FormRequest;
+use Illuminate\Validation\Validator;
+
+final class CreateReportRequest extends FormRequest
+{
+    /**
+     * @return array<string, array<int, mixed>>
+     */
+    public function rules(): array
+    {
+        return [
+            'start_date' => ['required', 'date'],
+            'end_date' => ['required', 'date'],
+            'delivery' => ['required', 'in:slack,email'],
+            'slack_channel' => ['nullable', 'string', 'starts_with:#'],
+        ];
+    }
+
+    /**
+     * @return array<int, callable>
+     */
+    public function after(): array
+    {
+        return [
+            function (Validator $validator): void {
+                $start = $this->date('start_date');
+                $end = $this->date('end_date');
+
+                if ($start !== null && $end !== null && $end->lessThanOrEqualTo($start)) {
+                    $validator->errors()->add('end_date', 'The end date must be after the start date.');
+                }
+
+                // Required-if-sibling: a Slack delivery needs a channel.
+                if ($this->validated('delivery') === 'slack' && ! $this->filled('slack_channel')) {
+                    $validator->errors()->add('slack_channel', 'A Slack channel is required for Slack delivery.');
+                }
+            },
+        ];
+    }
+}
+```
+
+`after()` (Laravel 11+) returns an array, so each cross-field concern can be its own small invokable class under `App\Rules\` when it grows or is reused — the same extraction rule as above. On older setups, the equivalent is `withValidator(Validator $validator)` calling `$validator->after(fn () => ...)`; prefer `after()` where available.
+
+### ❌ Avoid — leaking the comparison past validation
+
+```php
+// In the controller or Action — forbidden: the request reached here already
+// "valid", so a bad date range is now a runtime concern, not a 422.
+public function store(CreateReportRequest $request, CreateReport $createReport): RedirectResponse
+{
+    if ($request->date('end_date')->lessThanOrEqualTo($request->date('start_date'))) {
+        abort(422); // wrong layer, no field-level error, bypasses the form
+    }
+    // ...
+}
+```
+
+### Edge cases
+
+- **Short-circuiting:** `after()` runs only after the field rules pass, so guard against `null` — if `start_date` failed `date`, don't dereference it. (The `!== null` checks above do this.)
+- **Which field gets the error:** attach it to the field the user should fix (`end_date`, not `start_date`) so the message lands next to the right input.
+- **Don't double-validate:** anything expressible as a single-field rule (`required`, `date`, `in:...`) stays in `rules()`; `after()` is only for constraints that genuinely need a sibling's value.
+- **Stateless:** like all validation, `after()` only reports errors — it never writes. Persistence and orchestration remain the Action's job once the request is fully valid.
+
 ---
 
 ## `messages()` and `attributes()` — readable errors
@@ -647,3 +851,7 @@ Prefer `#[Validate]` for simple static rules and the `rules()` method when logic
 
 - [Controllers](controllers.md)
 - [Livewire](livewire.md)
+- [Actions](actions.md)
+- [DRY](dry.md)
+- [Error handling](error-handling.md)
+- [Testing](testing.md)

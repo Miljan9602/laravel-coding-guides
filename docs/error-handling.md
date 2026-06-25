@@ -12,6 +12,10 @@ Fail loudly and predictably. An error that surfaces immediately — with a typed
 - **Log with context, exactly once.** Either handle-and-log *or* rethrow — never both for the same failure.
 - **Untrusted input fails closed.** A bad webhook signature, an unverifiable payload, a missing token → reject. Never "allow on doubt".
 - **Distinguish "absent" from "broken".** A missing optional record may legitimately be `null`; a failed API call is an exception.
+- **`report()` a handled-but-notable degradation.** A catch-and-continue fallback that only `warning()`s is invisible to your error tracker; call `report($e)` so a week of silent degradation surfaces. `throw` the unexpected, `report()`+continue the notable, `warning()` only the mundane.
+- **Throttle exception reporting.** In `withExceptions`, `throttle(...)` and `dontReportDuplicates()` so a GitHub/AI outage can't flood and burn paid Sentry/Flare quota.
+- **Carry context across the request→job boundary with `Context`.** `Context::add('trace_id', …)` auto-appends to every log line and dehydrates into queued jobs with no plumbing; `Context::addHidden(...)` carries a tenant key without leaking it into logs.
+- **Decide a log's format, destination, and routing, not just its content.** JSON to `stderr` in containers, a `stack` channel, and severity routing (`critical` → Slack, `debug` → file).
 
 ## Never silently swallow errors
 
@@ -300,6 +304,344 @@ public function rateLimit(Workspace $workspace): int
 }
 ```
 
+## Report designed degradation, do not just log it
+
+A specified fallback (the previous section) is *correct* — but it is also *invisible*. Re-read the `SummaryChain`: when Anthropic throws, it `warning()`s and drops to the next rung. The report still ships, the test still passes, the dashboard stays green. Now imagine Anthropic has been 500ing for a week. Every digest has quietly run on the deterministic template the whole time, the AI you pay for has been dead for seven days, and *nobody knows*, because a `warning()` in a log file is something nobody reads until they already suspect a problem.
+
+That is the trap of a well-built fallback: it converts an outage into a non-event. The fix is to make the degradation tell your error tracker, not just your log file. `report($e)` hands the exception to the same pipeline as an uncaught error — Sentry/Flare, the `report` callbacks, the registered context — *without* rethrowing, so the fallback still proceeds. The error tracker groups identical degradations and shows you the frequency: "this provider has failed 4,000 times in seven days" is a page; one buried log line is not.
+
+Pick the right verb for the severity of the event:
+
+- **`throw`** — the failure is unexpected and this code does not know how to continue. Let it propagate to the boundary.
+- **`report($e)` then continue** — the failure is *handled* (a specified fallback covers it) but *notable*: it means a paid dependency is down or a quality guarantee is degraded. You want it counted and grouped.
+- **`warning()` only** — the event is genuinely mundane and expected at some baseline rate, and nobody needs to be told the count (e.g. a single optional enrichment that is fine to skip).
+
+### ❌ Avoid — a fallback that only logs; the outage is invisible
+
+```php
+foreach ($this->providers as $provider) {
+    try {
+        return $provider->summarise($contributor);
+    } catch (Throwable $e) {
+        // A week of "Anthropic is down" reduces to log lines nobody greps.
+        $this->logger->warning('Summary provider failed; falling back.', [
+            'provider' => $provider::class,
+            'exception' => $e->getMessage(),
+        ]);
+    }
+}
+```
+
+### ✅ Do — `report()` the notable rung, keep the run alive
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Services\Summaries;
+
+use App\Contracts\SummaryProvider;
+use App\Data\Contributor;
+use Psr\Log\LoggerInterface;
+use Throwable;
+
+final readonly class SummaryChain
+{
+    /** @param  list<SummaryProvider>  $providers  Ordered best-to-worst; the last MUST NOT throw. */
+    public function __construct(
+        private array $providers,
+        private LoggerInterface $logger,
+    ) {}
+
+    public function summarise(Contributor $contributor): string
+    {
+        $lastIndex = array_key_last($this->providers);
+
+        foreach ($this->providers as $index => $provider) {
+            try {
+                return $provider->summarise($contributor);
+            } catch (Throwable $e) {
+                // The terminal rung throwing is a real bug, not a degradation.
+                if ($index === $lastIndex) {
+                    throw $e;
+                }
+
+                // Notable: a paid AI provider just degraded the report's quality.
+                // report() surfaces frequency in the error tracker; the run still continues.
+                report($e);
+
+                $this->logger->warning('Summary provider failed; falling back.', [
+                    'provider' => $provider::class,
+                    'contributor' => $contributor->login,
+                ]);
+            }
+        }
+
+        throw SummaryChainExhausted::noTerminalProvider($contributor->login);
+    }
+}
+```
+
+Two things keep this honest. First, the terminal provider throwing is *not* a degradation — there is no further rung — so it rethrows; `report()` is for "we recovered, but you should know". Second, `report()` does **not** rethrow, so it does **not** collide with the "log exactly once" rule: there is exactly one report of this failure and the original `throw`-or-not decision is unchanged. Pair it with the throttling below so a sustained outage counts without flooding.
+
+Edge cases:
+
+- **Don't `report()` client-shaped failures.** A 4xx from a provider because *we* sent a bad request is a bug to throw and fix, not a degradation to count. Reserve `report()`+continue for outages and quality drops you have deliberately chosen to ride through.
+- **`report()` is testable.** `Exceptions::fake()` (Laravel 11+) lets a unit test assert `$exceptions->assertReported(AiProviderException::class)` for the middle rung and `assertNotReported(...)` for the success path — add it to the chain's per-rung tests.
+- **A bare `report()` with no argument** reports the *current* exception inside a `catch`; prefer the explicit `report($e)` so the call site reads unambiguously.
+
+## Throttle exception reporting
+
+`report()`-on-degradation and "let server errors propagate" are both correct — and both will, during a real outage, fire the *same* exception thousands of times in minutes. The per-minute `reports:dispatch` scheduler fans out one `GeneratePreviewReport` job per workspace; if GitHub or Anthropic is down, every job throws the same way at once. Unthrottled, that is thousands of identical events flooding Sentry/Flare, burning a paid monthly quota in an afternoon and burying the *one* novel error that actually needs you under a wall of duplicates.
+
+Laravel 11+ exposes two controls in `bootstrap/app.php` `withExceptions()`. `dontReportDuplicates()` collapses repeats of the *same exception instance* within a request/job. `throttle()` is the real lever: return a `Lottery` to sample a fixed fraction of a noisy type, or a `Limit` to cap a key at N per minute and drop the rest. You still see that the outage is happening — you just see it at a rate you can afford.
+
+### ❌ Avoid — every job reports every failure, unthrottled
+
+```php
+->withExceptions(function (Exceptions $exceptions): void {
+    // A GitHub outage during reports:dispatch sends thousands of identical
+    // events in one minute and exhausts the Flare quota by lunchtime.
+    $exceptions->context(fn (): array => ['team' => config('digest.team')]);
+})
+```
+
+### ✅ Do — sample the noisy, cap the rest, drop exact duplicates
+
+```php
+<?php
+
+use App\Exceptions\AiProviderException;
+use App\Exceptions\GitHubRateLimitException;
+use Illuminate\Cache\RateLimiting\Limit;
+use Illuminate\Foundation\Configuration\Exceptions;
+use Illuminate\Support\Lottery;
+use Throwable;
+
+->withExceptions(function (Exceptions $exceptions): void {
+    // Collapse repeats of one instance (e.g. retried within a single job).
+    $exceptions->dontReportDuplicates();
+
+    $exceptions->throttle(function (Throwable $e): Lottery|Limit|null {
+        // Outage-shaped, high-volume: a rate-limit storm only needs sampling.
+        if ($e instanceof GitHubRateLimitException) {
+            return Lottery::odds(1, 100);
+        }
+
+        // A provider outage: cap per type so the tracker shows it without flooding.
+        if ($e instanceof AiProviderException) {
+            return Limit::perMinute(30)->by($e::class);
+        }
+
+        // null => never throttled: novel, low-volume errors always report in full.
+        return null;
+    });
+})
+```
+
+`Lottery::odds(1, 100)` reports roughly one in a hundred — right for a type that fires constantly and whose *count* you read from request volume anyway. `Limit::perMinute(30)->by($e::class)` reports up to 30 of that class per minute then drops the rest until the window resets; the `->by()` key keeps two different outages in separate buckets so one cannot starve the other.
+
+Edge cases:
+
+- **Return `null` (or nothing) for the default.** Anything you don't recognise is presumed rare and *novel* — exactly what you must never sample away. Only throttle types you have identified as high-volume.
+- **Throttling is about the tracker, not the run.** A throttled exception is still thrown, still fails the job, still hits retry/backoff. You are rate-limiting the *report*, not changing program behaviour.
+- **`dontReportDuplicates()` is per request/job lifecycle**, not global — it dedupes the same instance bubbling through nested handlers, not the same *kind* recurring across thousands of jobs. That second case is what `throttle()` is for.
+
+## Observability: carry context across the request→job boundary
+
+Elsewhere we warn hard against ambient request state — reaching for `request()`, the authenticated user, or the resolved tenant from deep inside a service. That rule is right, but it leaves a real gap: when a Livewire action dispatches `GeneratePreviewReport`, the job runs *later*, on a *different* worker, with *no* request. How does a log line written inside that job know which workspace, which user, which original click it belongs to? Threading a `trace_id` through every constructor and method signature by hand is exactly the plumbing we are trying to avoid.
+
+Laravel's `Context` facade is the sanctioned mechanism. `Context::add('trace_id', …)` does two things for free: it appends the key to **every** subsequent log line in this lifecycle, and it **dehydrates into the payload of any job dispatched afterwards**, then rehydrates inside that job — so the worker's logs carry the same `trace_id` as the web request that queued it, with zero plumbing. This is *not* the ambient-state anti-pattern: it is explicit, write-once metadata for correlation, never read back as business input.
+
+### ✅ Do — stamp a trace id at the edge; it follows the work everywhere
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Middleware;
+
+use Closure;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Str;
+use Symfony\Component\HttpFoundation\Response;
+
+final class AssignTraceId
+{
+    public function handle(Request $request, Closure $next): Response
+    {
+        // Honour an upstream id (load balancer / front proxy) or mint one.
+        $traceId = $request->header('X-Request-Id') ?? (string) Str::uuid();
+
+        // Auto-appended to every log line AND dehydrated into queued jobs.
+        Context::add('trace_id', $traceId);
+
+        $response = $next($request);
+
+        // Echo it back so a user-reported error maps straight to the logs.
+        $response->headers->set('Request-Id', $traceId);
+
+        return $response;
+    }
+}
+```
+
+Now a log line written deep inside the queued job — on another machine, minutes later — carries the same `trace_id` without a single parameter being passed:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Jobs;
+
+use App\Contracts\Repositories\WorkspaceRepositoryInterface;
+use App\Services\Reports\WorkspaceReportRunner;
+use Illuminate\Contracts\Queue\ShouldQueue;
+use Illuminate\Support\Facades\Context;
+use Illuminate\Support\Facades\Log;
+
+final class GeneratePreviewReport implements ShouldQueue
+{
+    public function __construct(private int $workspaceId) {}
+
+    public function handle(
+        WorkspaceRepositoryInterface $workspaces,
+        WorkspaceReportRunner $runner,
+    ): void {
+        $workspace = $workspaces->findOrFail($this->workspaceId);
+
+        // trace_id rehydrated automatically; this line correlates with the web request.
+        Log::info('Generating preview report.', ['workspace' => $workspace->id]);
+
+        $runner->run($workspace);
+    }
+}
+```
+
+### Carry a secret across the boundary without leaking it
+
+The job needs the tenant's GitHub installation token to build the `WorkspaceReportContext`, and that token must travel with the dispatched job — but a token in a log line is a security incident. `Context::addHidden(...)` stores a value that **dehydrates into the job exactly like visible context** but is **never written to logs**. It carries the secret across the request→job seam without it ever surfacing in your log destination.
+
+```php
+// In the action that dispatches the job, after minting the installation token:
+Context::add('workspace_id', $workspace->id);          // safe to log
+Context::addHidden('installation_token', $token->value); // travels, never logged
+
+GeneratePreviewReport::dispatch($workspace->id);
+```
+
+```php
+// Inside the job: read the hidden value explicitly to bind the engine seam.
+$token = Context::getHidden('installation_token');
+$context = WorkspaceReportContext::forInstallation($workspace, $token);
+```
+
+### ❌ Avoid — reaching for ambient request state inside the job
+
+```php
+public function handle(): void
+{
+    // request() is null on the queue worker; auth() is the system, not the user.
+    // This either fatals or silently attributes the work to the wrong tenant.
+    $traceId = request()->header('X-Request-Id');
+    $token = auth()->user()->currentWorkspace->installation_token;
+}
+```
+
+Edge cases:
+
+- **Hidden context still *travels*.** `addHidden` is about log redaction, not transport secrecy — the value is serialized into the queue payload. Treat your queue store with the same care as any secret-bearing channel; this is not a substitute for encryption at rest.
+- **Don't reach for `Context` to fetch business inputs.** The job's identity (`$workspaceId`) belongs in its constructor where it is explicit and serialized as a typed argument. `Context` is for cross-cutting *correlation* metadata (trace id, request id) and the occasional carried secret — not for smuggling domain arguments past the type system.
+- **Set the response header even on error responses.** Register the middleware globally so a 500's `Request-Id` is the exact key the user quotes when they report the failure.
+
+## Structured logging: format, destination, routing
+
+The rest of this page is about a log's *content* — attach identifiers, log exactly once, never both log and rethrow. That guidance stands unchanged. But content is only half of observability; *where* the line goes and in *what shape* decides whether anyone can act on it. A human-readable line printed to a file is invisible inside a container that ships `stderr` to a log aggregator, and a `CRITICAL` that lands in the same file as a `DEBUG` is a page that nobody is paged for.
+
+Three decisions live in `config/logging.php`, not in the calling code — the call site stays `Log::warning($message, $context)` regardless:
+
+1. **Format.** In a containerized run, emit JSON so the aggregator can index every context key as a field. Laravel ships `Monolog\Formatter\JsonFormatter`; the message and the entire context array become queryable structured fields instead of an unparseable string.
+2. **Destination.** Containers expect logs on `stderr`, not a file the orchestrator never reads. Use the `stderr` channel (the `monolog` driver over `php://stderr`) in production, a readable file locally.
+3. **Routing by severity.** A `stack` channel fans one write out to several handlers, and Monolog's `level` gates each one — so `Log::critical(...)` reaches Slack while `Log::debug(...)` only ever hits a file.
+
+### ✅ Do — JSON to stderr, a stack, and severity routing
+
+```php
+<?php
+
+// config/logging.php
+
+use Monolog\Formatter\JsonFormatter;
+use Monolog\Handler\StreamHandler;
+
+return [
+    'default' => env('LOG_CHANNEL', 'stack'),
+
+    'channels' => [
+        // One write fans out to all listed channels.
+        'stack' => [
+            'driver' => 'stack',
+            'channels' => ['stderr', 'slack'],
+            'ignore_exceptions' => false,
+        ],
+
+        // Structured JSON on stderr: the container runtime ships it to the aggregator.
+        'stderr' => [
+            'driver' => 'monolog',
+            'level' => env('LOG_LEVEL', 'debug'),
+            'handler' => StreamHandler::class,
+            'formatter' => JsonFormatter::class,
+            'with' => ['stream' => 'php://stderr'],
+        ],
+
+        // Severity routing: only critical+ ever pages the on-call Slack channel.
+        'slack' => [
+            'driver' => 'slack',
+            'url' => env('LOG_SLACK_WEBHOOK_URL'),
+            'level' => 'critical',
+        ],
+    ],
+];
+```
+
+With that stack in place, the severity of the *call* decides the destination, and the calling code never changes:
+
+```php
+// Mundane degradation: indexed JSON on stderr, never pages anyone.
+Log::warning('Summary provider failed; falling back.', [
+    'workspace' => $workspace->id,
+    'provider' => $provider::class,
+]);
+
+// A delivery invariant broke: same call shape, but this one reaches Slack.
+Log::critical('Report delivery dispatched with no channel configured.', [
+    'workspace' => $workspace->id,
+    'report' => $report->id,
+]);
+```
+
+### ❌ Avoid — pre-formatted strings to a file the container can't see
+
+```php
+// Defeats structured logging: the context is melted into the message,
+// so the aggregator can't filter by workspace, and a single-file 'daily'
+// channel inside a container is written to a path nobody ever reads.
+Log::channel('daily')->warning(
+    "Summary provider {$provider} failed for workspace {$workspace->id}",
+);
+```
+
+Edge cases:
+
+- **`env()` belongs in `config/logging.php` and nowhere else.** Config files are the one sanctioned place to read `env()`; every call site uses `config()`/the channel name. (See [Configuration & secrets](config-and-secrets.md).)
+- **Match the format to the runtime.** JSON-to-stderr is correct in production containers and miserable to read while developing; key it off the channel so local stays human-readable and prod stays machine-parseable.
+- **`'ignore_exceptions' => false`** on the stack means a broken Slack webhook surfaces instead of silently dropping your logs — fail loudly, even in the logging layer.
+- **Severity is routing, not decoration.** Reserve `critical`/`emergency` for things that should page a human; if everything is `error`, the Slack handler becomes noise and gets muted, and you are back to no alerting.
+
 ## Client errors vs server errors
 
 These are two different categories with two different correct responses, and conflating them produces both noise and blind spots.
@@ -462,5 +804,7 @@ The missing-header case must be its own guard. Absence of proof is not proof.
 
 ## See also
 
-- [Configuration & secrets](config-and-secrets.md) — where webhook secrets and API keys come from, and why it's `config()` not `env()`.
-- [Testing](testing.md) — how to test thrown exceptions, the fallback chain, and fail-closed webhook handling.
+- [Configuration & secrets](config-and-secrets.md) — where webhook secrets and API keys come from, why it's `config()` not `env()`, and the one place (`config/logging.php`) `env()` is allowed.
+- [Tooling & CI](tooling-and-ci.md) — wiring the error tracker (Sentry/Flare), log destinations per environment, and what the pipeline does with reported failures.
+- [Jobs, commands & scheduling](jobs-commands-scheduling.md) — the `reports:dispatch` fan-out and `GeneratePreviewReport` job whose failures the throttling and `Context` correlation above are built for.
+- [Testing](testing.md) — how to test thrown exceptions, the fallback chain, `Exceptions::fake()` reporting assertions, and fail-closed webhook handling.

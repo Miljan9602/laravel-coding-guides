@@ -302,16 +302,36 @@ from [philosophy](philosophy.md) when a box is contested.
 - [ ] No duplicated logic — repeated branches/queries/formatting are extracted (DRY), and existing helpers were checked before writing new ones.
 - [ ] Models hold only casts, relations, and scopes — no business logic or I/O. ([models](models-eloquent.md))
 
+### Persistence & performance
+
+- [ ] Repository reads that are looped over relations eager-load them (`with()`/`load()`); no N+1. ([repositories](repositories.md))
+- [ ] Unbounded reads use `cursor()`/`lazy()`, and **mutating** loops use `chunkById()`/`lazyById()` (never `chunk()` over a mutated column). ([repositories](repositories.md))
+- [ ] `Model::shouldBeStrict()` is on in non-production; no code relies on silent lazy-load / dropped-attribute / missing-attribute behaviour. ([models](models-eloquent.md))
+- [ ] Migrations: real reversing `down()`; money as integer-cents/`decimal` never `float`; `->change()` restates every modifier; FKs via `foreignId()->constrained()`. ([migrations](migrations.md))
+
+### Livewire
+
+- [ ] Identity / server-authoritative public properties (`$workspaceId`, ids) are `#[Locked]`. ([livewire](livewire.md))
+- [ ] Every mutating Livewire method re-authorizes (`$this->authorize(...)`/policy) — page-load auth does **not** run on `/livewire/update`. ([livewire](livewire.md))
+- [ ] No secrets or other tenants' records are stored in public properties (they serialize to the client).
+
+### Jobs & observability
+
+- [ ] Jobs set `timeout` < queue `retry_after`, sane `tries`/`backoff`, and `ShouldBeUnique`/`onOneServer` where duplicate runs would harm. ([jobs](jobs-commands-scheduling.md))
+- [ ] Designed-degradation paths `report()` to the error tracker (not just `Log::warning`); a `trace_id` is carried request→job via `Context`. ([error handling](error-handling.md))
+
 ### Config & secrets
 
 - [ ] `config()` is used everywhere outside `config/*.php`; no stray `env()` calls in app code. ([configuration](config-and-secrets.md))
 - [ ] No secrets committed — keys/webhooks live in `.env`, mapped through a config file, and `.env` is not in the diff.
+- [ ] `APP_DEBUG=false` in production; `composer audit` is green (no known-CVE dependency). ([tooling & CI](tooling-and-ci.md))
 
 ### Tests
 
 - [ ] A unit test exists for each new class and a feature test for each new feature. ([testing](testing.md))
 - [ ] No test hits the network; mocks and fakes target interfaces (`Http::fake()`, fake `GitHubClient`/`AiClient`).
 - [ ] Tests assert behaviour and edge cases, not just the happy path; failures fail loudly with clear messages.
+- [ ] Architecture rules are enforced by Pest `arch()` tests, not just review (Eloquent-only-in-repositories, thin controllers, `final`/`readonly`). ([testing](testing.md))
 
 ### Final gate
 
@@ -327,6 +347,7 @@ from [philosophy](philosophy.md) when a box is contested.
 - [Services](services.md)
 - [Repositories](repositories.md)
 - [Models](models-eloquent.md)
+- [Migrations](migrations.md)
 - [Livewire](livewire.md)
 - [Jobs](jobs-commands-scheduling.md)
 - [Testing](testing.md)

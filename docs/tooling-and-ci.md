@@ -10,9 +10,14 @@ The standards in this guide are only real if a machine enforces them. This page 
 - **Static analysis is enforced by Larastan/PHPStan** at the highest level the codebase sustains; type errors fail the build like a broken test.
 - **All entry points are Composer scripts**: `lint`, `lint:test`, `analyse`, `test`, and `check`. Engineers and CI invoke the same commands.
 - **`composer check` runs before every commit** — it is `lint:test` + `analyse` + `test` and must be green locally before you push.
-- **CI runs on every push and PR**: it checks formatting (`lint:test`), runs static analysis (`analyse`), then runs the full Pest suite.
+- **CI runs on every push and PR**: it checks formatting (`lint:test`), runs static analysis (`analyse`), audits dependencies for known CVEs (`audit`), then runs the full Pest suite.
 - **Tests run on SQLite `:memory:` for speed** but a Postgres service is available in CI for migration-fidelity checks.
 - **PHP 8.4 everywhere** — local, CI, and production must agree on the runtime.
+- **Each enforcement tool owns one axis**: Pint = style, PHPStan = types, Pest `arch()` = architecture (the rules in this guide), Pest = behaviour. A rule with no enforcing tool is a suggestion, not a standard.
+- **Security is a CI gate, not an afterthought.** `composer audit` fails the build on a dependency with a known CVE, and `roave/security-advisories` makes Composer *refuse to install* a vulnerable version in the first place.
+- **Third-party Actions are pinned to a commit SHA**, never a moving `@v4` tag — a tag can be re-pointed at malicious code; a SHA cannot.
+- **The workflow runs least-privilege**: a top-level `permissions: { contents: read }`, escalated per-job only where a job genuinely needs to write.
+- **`APP_DEBUG=false` in production**, always — Ignition's debug page leaks environment variables, secrets, and stack traces to anyone who triggers an error.
 
 ## Pint: the formatter
 
@@ -221,6 +226,7 @@ Add the `scripts` block to `composer.json` (the rest of the file is elided).
         "lint": "./vendor/bin/pint",
         "lint:test": "./vendor/bin/pint --test",
         "analyse": "./vendor/bin/phpstan analyse --memory-limit=512M",
+        "audit": "composer audit --no-dev=false",
         "test": "php artisan test",
         "check": [
             "@lint:test",
@@ -232,6 +238,7 @@ Add the `scripts` block to `composer.json` (the rest of the file is elided).
         "lint": "Format the codebase with Pint (writes files).",
         "lint:test": "Check formatting without writing; fails on drift.",
         "analyse": "Run Larastan/PHPStan static analysis.",
+        "audit": "Fail if any installed dependency has a known CVE.",
         "test": "Run the Pest test suite.",
         "check": "Run formatting check + static analysis + tests; the pre-commit gate."
     }
@@ -242,6 +249,7 @@ Notes:
 
 - **`test` uses `php artisan test`.** This is Laravel's test runner, which delegates to Pest (or PHPUnit) and applies the framework's environment bootstrapping. If you prefer to invoke Pest directly, `"./vendor/bin/pest"` is equivalent for this project — pick one and keep it consistent between local and CI.
 - **`analyse` runs PHPStan via the Larastan extension** (covered in the next section). `--memory-limit=512M` keeps large analyses from aborting; raise it on bigger codebases.
+- **`audit` runs `composer audit`** against the full dependency tree (see *Security as a CI gate* below). It is **deliberately not part of `check`** — the audit result depends on the upstream advisory database, not on your diff, so a freshly-disclosed CVE could turn a developer's local `composer check` red on code they never touched. Dependency health is a *pipeline* concern, gated on its own CI step and a scheduled run; `check` stays a pure function of your branch so "it's green locally" always means "my changes are correct".
 - **`check` references other scripts with `@`.** `@lint:test`, `@analyse`, and `@test` invoke the named scripts in order. The array stops at the first non-zero exit, so a formatting failure short-circuits before analysis, and an analysis failure short-circuits before tests — you fix problems cheapest-first.
 
 ### Invoking the scripts
@@ -250,6 +258,7 @@ Notes:
 composer lint        # auto-format everything
 composer lint:test   # CI-style format check, no writes
 composer analyse     # run static analysis
+composer audit       # fail on any dependency with a known CVE
 composer test        # run the suite
 composer check       # lint:test + analyse + test — run this before you commit
 ```
@@ -409,16 +418,216 @@ it('stores jsonb metadata round-trip on postgres', function (): void {
 
 Tag these `->group('pgsql')` so they're easy to run or skip in isolation.
 
+## Security as a CI gate
+
+Pint, PHPStan, and the suite all check *your* code. None of them check the code you *depend on* — and in a Laravel app that is the larger attack surface. A SaaS that holds OAuth tokens, GitHub App installation credentials, and Slack webhooks cannot afford to ship a transitive dependency with a published, exploitable CVE. The cautionary tale is recent and exact: **Livewire shipped a critical remote-code-execution vulnerability, [CVE-2025-54068](https://github.com/livewire/livewire/security/advisories/GHSA-3xq2-wv9p-7h7x)** (property-update payloads could be coerced into arbitrary command execution). Our entire authenticated surface — login, the OAuth connect flow, every `InteractsWithWorkspace` Livewire screen — runs on Livewire. An app with that footprint that does not mechanically gate against a known-vulnerable Livewire release is one `composer update` away from disaster. So dependency security is a build gate, enforced two ways: *detection* (`composer audit`) and *prevention* (`roave/security-advisories`).
+
+### Detection: `composer audit` in the pipeline
+
+`composer audit` cross-references every installed package against the [PHP Security Advisories Database](https://github.com/FriendsOfPHP/security-advisories) and exits non-zero if any installed version is affected. It is a *reactive* check — it tells you the lockfile you already resolved contains something vulnerable.
+
+```bash
+composer audit            # audit installed packages; non-zero exit on any advisory
+composer audit --locked   # audit composer.lock without a full install (fast CI pre-check)
+```
+
+We wire it in as its own CI step (shown in the workflow below) and as the `composer audit` script. Run it on a **schedule** too, not only on push: a CVE disclosed against a dependency you haven't touched in months should turn the pipeline red the morning it lands, not the next time someone happens to open a PR. A nightly `schedule:` trigger on the workflow does exactly that.
+
+### Prevention: `roave/security-advisories` as a rejection list
+
+Detection tells you *after* you've resolved a bad version. Prevention stops it resolving at all. [`roave/security-advisories`](https://github.com/Roave/SecurityAdvisories) is a `require-dev` package that ships **no code** — it is a giant set of `conflict` constraints, one per known-vulnerable release of every package in the advisory database. Because Composer's solver treats those conflicts as hard, `composer require` or `composer update` will **refuse to install** a version with a known CVE: the dependency resolver fails loudly instead of silently pulling in the exploitable release.
+
+```bash
+composer require --dev roave/security-advisories:dev-latest
+```
+
+```json
+{
+    "require-dev": {
+        "roave/security-advisories": "dev-latest"
+    }
+}
+```
+
+With this in place, an attempt to land a vulnerable Livewire is rejected at resolve time:
+
+✅ **Do** — let the solver block the bad version before it ever enters the lockfile:
+
+```bash
+$ composer require livewire/livewire:^3.6.0
+# Your requirements could not be resolved to an installable set of packages.
+#
+#   Problem 1
+#     - roave/security-advisories dev-latest conflicts with livewire/livewire 3.6.0
+#       (CVE-2025-54068).
+#     - Root composer.json requires livewire/livewire ^3.6.0 -> satisfiable only by
+#       a version conflicting with roave/security-advisories.
+```
+
+❌ **Avoid** — relying on humans to read advisories and a CI step as the *only* line of defence:
+
+```bash
+# Without roave/security-advisories, this resolves happily…
+$ composer require livewire/livewire:^3.6.0   # installs the CVE'd release
+# …and the vulnerability only surfaces later, when `composer audit` runs in CI —
+# by which point the bad lockfile is already committed and pushed.
+```
+
+The two tools are complementary, not redundant: `roave/security-advisories` is a **prevention** wall at `composer require` time on the developer's machine; `composer audit` is the **detection** backstop in CI that also catches advisories published *after* a version was already installed (a conflict list is only as fresh as your last `composer update` of it). Run both.
+
+### One-line production hardening: `APP_DEBUG=false`
+
+The cheapest security fix in any Laravel app is one environment variable. **`APP_DEBUG` must be `false` in production.** With it `true`, Laravel's debug-error page (Ignition) renders a full stack trace, the resolved request, and — critically — a dump of the environment on any unhandled exception, handing an attacker your `APP_KEY`, database password, `ANTHROPIC_API_KEY`, GitHub App private key, and Slack webhook in a single error. Keep `APP_DEBUG=true` for local development only; assert `false` in your production `.env` and, ideally, fail the deploy if it isn't.
+
+## Harden the GitHub Actions workflow
+
+The workflow itself is code that runs with access to your repository and — via `secrets` — your tokens. A CI pipeline that pulls in third-party Actions by a moving tag, runs with broad write permissions, and never cancels superseded runs is a supply-chain liability bolted onto your security gate. Three changes close the gaps: pin Actions to a commit SHA, run least-privilege, and cancel stale runs.
+
+### Pin third-party Actions to a commit SHA
+
+A tag like `@v4` is a **moving pointer**. If a maintainer's account is compromised (or they retag a release), `@v4` can be silently re-pointed at malicious code that now runs with access to your `GITHUB_TOKEN` and secrets — and your pipeline picks it up on the next run with no diff to review. A 40-character commit SHA is immutable: it can only ever resolve to the exact tree you audited. Pin every third-party Action to a SHA, and leave a trailing comment naming the human-readable version so dependency-update bots (and humans) can read it.
+
+✅ **Do** — pin to a full commit SHA, annotated with the version:
+
+```yaml
+steps:
+  - name: Checkout
+    uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+  - name: Setup PHP 8.4
+    uses: shivammathur/setup-php@cf4cade2721041f288618926317de27f8e2a4c97 # v2.34.1
+```
+
+❌ **Avoid** — a moving tag that can be re-pointed under you:
+
+```yaml
+steps:
+  - name: Checkout
+    uses: actions/checkout@v4          # mutable: @v4 can be retagged at any time
+
+  - name: Setup PHP 8.4
+    uses: shivammathur/setup-php@v2    # mutable: trusts the maintainer's account forever
+```
+
+> First-party `actions/*` are lower-risk than community Actions, but the rule is uniform: pin *everything* third-party to a SHA. Let Dependabot (`package-ecosystem: github-actions`) propose SHA bumps as reviewable PRs so pinning doesn't mean going stale.
+
+### Least-privilege `permissions`
+
+By default the automatic `GITHUB_TOKEN` is handed to the workflow with broad read/write scopes. A lint-and-test job needs to *read* the repo and nothing more. Declare a restrictive **top-level** `permissions:` so every job starts from least privilege, then escalate per-job only where a job genuinely writes (publishing coverage, commenting on a PR, pushing a tag). If the token is exfiltrated by a compromised Action, `contents: read` sharply limits the blast radius.
+
+✅ **Do** — deny by default at the top, grant narrowly per job:
+
+```yaml
+# Top of the workflow: every job inherits read-only unless it overrides.
+permissions:
+  contents: read
+
+jobs:
+  check:
+    # inherits contents: read — a lint/analyse/audit/test job needs nothing more.
+    runs-on: ubuntu-latest
+
+  coverage-comment:
+    # this job posts a coverage comment, so it escalates exactly one scope:
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+```
+
+❌ **Avoid** — silent broad scopes, or escalating everything globally:
+
+```yaml
+# No permissions: block at all → the token keeps the broad default scopes.
+# Or, worse, granting write globally so one job's need leaks to every job:
+permissions:
+  contents: write
+  pull-requests: write
+```
+
+### Cancel superseded runs with `concurrency`
+
+Pushing twice to the same PR in quick succession starts two full runs; the older one is wasted compute and can finish *after* the newer one, reporting a stale status. A `concurrency` group keyed by workflow + ref cancels the in-flight run when a newer commit arrives. Key it by `github.ref` so each branch/PR has its own group and runs never cancel across branches.
+
+```yaml
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+```
+
+### The amended workflow header
+
+Folded together, the top of `.github/workflows/ci.yml` becomes:
+
+```yaml
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 6 * * *'   # nightly: re-audit deps against freshly disclosed CVEs
+
+# Least privilege by default; jobs escalate only what they need.
+permissions:
+  contents: read
+
+# Cancel an in-flight run when a newer commit lands on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint, Analyse, Audit & Test (PHP 8.4)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup PHP 8.4
+        uses: shivammathur/setup-php@cf4cade2721041f288618926317de27f8e2a4c97 # v2.34.1
+        with:
+          php-version: '8.4'
+          extensions: pdo_pgsql, pdo_sqlite, mbstring, bcmath
+          coverage: none
+          tools: composer:v2
+
+      # …caching, install, key:generate, lint:test, analyse as before…
+
+      - name: Audit dependencies
+        run: composer audit
+
+      - name: Run tests
+        run: composer test
+        env:
+          DB_CONNECTION: sqlite
+          DB_DATABASE: ':memory:'
+```
+
+The SHAs above are illustrative — copy the real ones from each Action's release page when you pin. The audit step sits **after** static analysis and **before** the suite: it's fast, and a vulnerable dependency should fail the build whether or not the tests pass.
+
 ## Putting it together
+
+Four tools cover four orthogonal axes, and every standard in this guide belongs to exactly one of them:
+
+- **Pint enforces *style*** — formatting, imports, `declare(strict_types=1)`.
+- **PHPStan enforces *types*** — the signatures line up across branches your tests don't cover.
+- **Pest `arch()` tests enforce *architecture*** — the layering rules this guide describes are not just prose. Controllers touch no Eloquent, Actions expose one `handle()`, models are `final`, repository interfaces are the only seam to the database: each is an executable assertion. See [Testing](testing.md) for the `arch()` rule set. An architecture rule with no `arch()` test is a code-review opinion, not a standard; this is what makes the guide self-enforcing.
+- **Pest enforces *behaviour*** — the unit and feature suites prove the code does what it claims.
+
+Layered on top, **`composer audit` + `roave/security-advisories` enforce *dependency security*** — the one axis that can go red without anyone changing a line of code.
 
 The full enforcement loop is:
 
-1. You write code. Pint's `declare_strict_types` and import rules mean you don't fuss over boilerplate; you do add `final` by hand.
-2. Before committing you run **`composer check`** — `lint:test`, then `analyse`, then the suite — and it's green.
-3. You push. **CI** runs the identical commands plus a real Postgres for migration-fidelity specs.
+1. You write code. Pint's `declare_strict_types` and import rules mean you don't fuss over boilerplate; you do add `final` by hand. `roave/security-advisories` already blocks any vulnerable dependency from resolving when you `composer require`.
+2. Before committing you run **`composer check`** — `lint:test`, then `analyse`, then the suite (which includes the `arch()` architecture tests) — and it's green.
+3. You push. **CI** runs the identical commands, plus `composer audit` (and a nightly re-audit), plus a real Postgres for migration-fidelity specs.
 4. The PR cannot merge unless that job passes.
 
-Because steps 2 and 3 invoke the same Composer scripts, there is no daylight between "passes locally" and "passes in CI". That equivalence is the whole point of the tooling.
+Because steps 2 and 3 invoke the same Composer scripts, there is no daylight between "passes locally" and "passes in CI" — with one deliberate exception: `composer audit` lives in CI only (see the *Composer scripts* notes), because dependency health is a function of the upstream advisory feed, not of your branch. That equivalence is the whole point of the tooling.
 
 ### Optional: make the gate automatic
 
@@ -460,5 +669,8 @@ trim_trailing_whitespace = false
 ## See also
 
 - [Code Style](code-style.md)
-- [Testing](testing.md)
+- [Testing](testing.md) — the Pest `arch()` rules that enforce this guide's architecture
+- [Architecture](architecture.md) — the layering the `arch()` tests assert
+- [Config & Secrets](config-and-secrets.md) — `APP_DEBUG=false` and keeping secrets out of error pages
+- [Livewire](livewire.md) — the authenticated surface the Livewire CVE gate protects
 - [Philosophy](philosophy.md)

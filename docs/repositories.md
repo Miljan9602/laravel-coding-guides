@@ -11,6 +11,10 @@ A repository is the single seam through which the application reads and writes p
 - Eloquent is allowed ONLY inside: repository implementations, model relationship/cast/attribute definitions, Filament resource/table/infolist declarations, factories/seeders, and tests.
 - Pure static helpers on a model (e.g. `DeliveryChannel::hashTarget()`) are fine — they aren't data access.
 - Add only the methods the app actually calls. Don't pre-build a generic CRUD surface "just in case."
+- Kill N+1 at the seam: a repository read eager-loads (`with([...])`) every relationship its callers touch and returns a fully-prepared aggregate. Deciding what to eager-load is the repository's job, never the caller's.
+- Constrain eager loads (`with(['reports' => fn (Builder $q) => $q->latest()->limit(5)])`) and scope columns (`with('author:id,login,name')`); `preventLazyLoading()` turns a missed `with()` into a loud exception in dev/CI.
+- Stream large reads: `lazy()`/`cursor()` for a read-only pass, `chunkById()`/`lazyById()` for a *mutating* loop. `chunk()` over a column you mutate skips rows (OFFSET drift) — `chunkById()` is keyset-safe.
+- Cap pagination server-side in the repository (`$perPage = min($perPage, 100)`) — unbounded `per_page` is a DoS vector; reach for `cursorPaginate()` on large/live feeds.
 - Tests bind a fake implementation of the interface; no test reaches the database to exercise application logic.
 
 ## The central rule: application code never touches a model directly
@@ -294,7 +298,7 @@ public function reportsFor(Workspace $workspace): Builder
 }
 ```
 
-When a screen needs pagination, return a paginator from the repository rather than a builder — the paginator is a finished result, not an open query.
+When a screen needs pagination, return a paginator from the repository rather than a builder — the paginator is a finished result, not an open query. Cap `$perPage` inside the repository: `per_page` usually arrives from the request, and an unbounded value (`?per_page=1000000`) is a denial-of-service vector — it lets a client force one query to materialise the entire table into memory. The repository is the only place that sees every read, so the ceiling belongs here, not in a controller.
 
 ```php
 use Illuminate\Contracts\Pagination\LengthAwarePaginator;
@@ -304,6 +308,9 @@ use Illuminate\Contracts\Pagination\LengthAwarePaginator;
  */
 public function paginatePublishedForWorkspace(Workspace $workspace, int $perPage = 25): LengthAwarePaginator
 {
+    // Clamp server-side: an attacker-supplied per_page must never blow past 100.
+    $perPage = min(max($perPage, 1), 100);
+
     return Report::query()
         ->where('workspace_id', $workspace->id)
         ->whereNotNull('published_at')
@@ -312,7 +319,200 @@ public function paginatePublishedForWorkspace(Workspace $workspace, int $perPage
 }
 ```
 
+For a large or live feed (an activity timeline, an append-heavy log of `ContributorSummary` rows) prefer `cursorPaginate()` over `paginate()`: it is keyset-based, so it does not run a `COUNT(*)` and does not suffer `OFFSET` drift when rows are inserted between page loads. The return type is `CursorPaginator<int, Report>`; the trade-off is no total count and forward/back-only navigation, which is exactly what an infinite-scroll feed wants.
+
 If you genuinely need flexible filtering, accept a typed criteria object as a parameter and build the query inside the repository — keep the assembly behind the seam, not in the caller.
+
+## Eager loading: kill N+1 at the seam
+
+### Why
+
+The **N+1 query problem** is the single most common performance bug in an Eloquent application. It happens when you load a collection of N parent rows with one query, then access a relationship inside a loop — and each access fires *one more* query. Render 50 `Report`s and read `$report->contributors` for each, and you have issued 1 query for the reports plus 50 for the contributors: **51 queries** where 2 would do. Under load this is the difference between a 30 ms page and a timeout.
+
+The boundary makes this a solved problem instead of a recurring one. A repository method returns a **fully-prepared aggregate** — the model *and* every relationship the caller is going to touch, already loaded. Deciding what to eager-load is the repository's job, because the repository is the one place that sees the relationship access pattern of every consumer. The caller must never have to "remember to eager-load"; if it could, the boundary has leaked.
+
+This is also why `preventLazyLoading()` (see [Models & Eloquent](models-eloquent.md)) is enabled in dev and CI: a relationship accessed without a matching `with()` throws a `LazyLoadingViolationException` instead of silently degrading into N+1. A missed `with()` becomes a loud test failure at the seam, not a slow query in production.
+
+### How
+
+❌ Avoid — a bare `->get()` whose relationships the caller then loops over (textbook N+1):
+
+```php
+// Repository — returns reports with NO relationships loaded:
+public function publishedForWorkspace(Workspace $workspace): Collection
+{
+    return Report::query()
+        ->where('workspace_id', $workspace->id)
+        ->whereNotNull('published_at')
+        ->get(); // ❌ contributors not loaded
+}
+
+// Caller — one query per report to fetch contributors: 1 + N:
+foreach ($this->reports->publishedForWorkspace($workspace) as $report) {
+    foreach ($report->contributors as $contributor) { // ❌ fires a query each iteration
+        $lines[] = $contributor->login;
+    }
+}
+```
+
+✅ Do — eager-load inside the repository so the aggregate arrives complete:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Repositories;
+
+use App\Contracts\Repositories\ReportRepositoryInterface;
+use App\Models\Report;
+use App\Models\Workspace;
+use Illuminate\Database\Eloquent\Builder;
+use Illuminate\Support\Collection;
+
+final readonly class ReportRepository implements ReportRepositoryInterface
+{
+    /**
+     * @return Collection<int, Report>
+     */
+    public function publishedForWorkspaceWithContributors(Workspace $workspace): Collection
+    {
+        return Report::query()
+            ->where('workspace_id', $workspace->id)
+            ->whereNotNull('published_at')
+            ->with(['contributors']) // ✅ 1 query for reports + 1 for all contributors
+            ->latest('published_at')
+            ->get();
+    }
+}
+```
+
+When the caller already holds a model and needs a relationship it did not ask for up front, the repository exposes a `load*` method rather than letting the caller call `->load()` itself (which would be Eloquent leaking past the seam):
+
+```php
+public function loadContributors(Report $report): Report
+{
+    return $report->load(['contributors']); // ✅ deferred eager-load, still behind the boundary
+}
+```
+
+**Constrain the eager load** when you only need a slice of a relationship — never pull an unbounded child set into memory:
+
+```php
+/**
+ * Latest five reports per workspace, contributors loaded — for a dashboard card.
+ *
+ * @return Collection<int, Workspace>
+ */
+public function recentReportsForWorkspaces(Collection $workspaces): Collection
+{
+    return Workspace::query()
+        ->whereIn('id', $workspaces->pluck('id'))
+        ->with([
+            'reports' => fn (Builder $query): Builder => $query->latest('generated_at')->limit(5),
+            'reports.contributors',
+        ])
+        ->get();
+}
+```
+
+**Scope eager-loaded columns** when the relationship is wide but you read two fields — `with('author:id,login,name')` selects only those columns (the local key `id` must be included or the relationship cannot be matched up):
+
+```php
+public function withAuthors(Workspace $workspace): Collection
+{
+    return Report::query()
+        ->where('workspace_id', $workspace->id)
+        ->with('author:id,login,name') // ✅ three columns, not the whole row
+        ->get();
+}
+```
+
+### Edge cases
+
+- **Aggregates over relations** — to show "report has 12 contributors" without loading the rows, use `withCount('contributors')` and read `$report->contributors_count`. Counting is a relationship access too; do it at the seam.
+- **Eager-load vs. lazy-load decision is the repository's, always.** A method named `...WithContributors` advertises what it loads. If two callers need different relationship sets, expose two intent-named methods — do not add a `array $with` parameter that pushes the decision back onto the caller.
+- **Don't over-fetch either.** Eager-loading a relationship nobody reads is wasted I/O. Load exactly what the method's consumers touch — no more, no less.
+
+## Iterating large result sets without exhausting memory
+
+### Why
+
+The rule "return finished results, never a builder" is right for the common case, but a `->get()` materialises **every** matched row into memory at once. For a prune or backfill that spans tens of thousands of `Report` or `ContributorSummary` rows — the kind of work `PruneStaleReports` does on the `reports:dispatch` cadence — that collection can exhaust the worker's memory and OOM-kill the job. These reads need to *stream*, and the repository is still where that strategy is chosen.
+
+### How
+
+Pick the streaming primitive by what the loop does:
+
+| Loop intent | Use | Why |
+| --- | --- | --- |
+| Read-only pass over many rows | `lazy()` / `cursor()` | Streams a `LazyCollection`; holds one row (or one chunk) in memory at a time. |
+| **Mutating** each row (update/delete) as you iterate | `chunkById()` / `lazyById()` | Keyset pagination on the primary key — safe while rows change underneath you. |
+
+**The trap:** `chunk()` (and `lazy()` filtered by a `where`) paginates with `LIMIT/OFFSET`. If your loop mutates the very column the `where` filters on, rows shift out of the result window and the offset **skips** them — you silently process only half the set. `chunkById()` is keyset-based (it walks `where id > $lastId`), so mutating a non-key column never drifts the cursor. Rule: **the moment a loop writes, switch from `chunk()` to `chunkById()`.**
+
+✅ Do — a repository read that streams a `LazyCollection` for a read-only pass:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Repositories;
+
+use App\Contracts\Repositories\ReportRepositoryInterface;
+use App\Models\Report;
+use Illuminate\Support\LazyCollection;
+
+final readonly class ReportRepository implements ReportRepositoryInterface
+{
+    /**
+     * Stream every report older than the cutoff, one at a time.
+     *
+     * @return LazyCollection<int, Report>
+     */
+    public function streamStaleReports(\DateTimeInterface $cutoff): LazyCollection
+    {
+        return Report::query()
+            ->where('generated_at', '<', $cutoff)
+            ->orderBy('id')
+            ->lazy(); // ✅ never more than one chunk resident in memory
+    }
+}
+```
+
+For a **mutating** prune, expose a callback-driven method so the keyset iteration — and the `PruneStaleReports` deletion — both stay behind the seam:
+
+```php
+/**
+ * Delete stale reports in keyset-paginated batches.
+ *
+ * @return int Number of rows pruned.
+ */
+public function pruneStaleReports(\DateTimeInterface $cutoff): int
+{
+    $pruned = 0;
+
+    Report::query()
+        ->where('generated_at', '<', $cutoff)
+        ->chunkById(config('digest.prune_chunk_size'), function ($reports) use (&$pruned): void {
+            foreach ($reports as $report) {
+                $report->delete(); // ✅ mutation is safe — chunkById walks the primary key
+                $pruned++;
+            }
+        });
+
+    return $pruned;
+}
+```
+
+The `PruneStaleReports` job then holds no query logic at all — it calls `$this->reports->pruneStaleReports($cutoff)` and logs the count. The chunk size comes from `config('digest.prune_chunk_size')`, never `env()` outside config.
+
+### Edge cases
+
+- **`cursor()` keeps the connection open** for the duration of the iteration and uses PHP generators; do not nest a second long query inside the loop on the same connection. `lazy()` (chunked under the hood) is the safer default and what most repositories should return.
+- **`lazyById()`** is the `LazyCollection` equivalent of `chunkById()` — reach for it when you want a streaming *return value* over a mutating set, rather than a callback.
+- **Don't leak the generator.** A `LazyCollection` is a finished, typed result — fine to return. A raw query builder is not; `->lazy()` / `->cursor()` must be called *inside* the repository, so the boundary still holds.
 
 ## The Eloquent boundary, defined precisely
 
@@ -522,4 +722,5 @@ The boilerplate buys a single, enforceable seam — and on a project of any long
 
 - [Models & Eloquent](models-eloquent.md)
 - [Services & Actions](services.md)
+- [Jobs, Commands & Scheduling](jobs-commands-scheduling.md)
 - [Testing](testing.md)

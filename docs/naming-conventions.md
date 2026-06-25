@@ -648,6 +648,7 @@ resources/views/
 - [Architecture](architecture.md) — where each named layer lives and how data flows between them.
 - [Actions](actions.md) — the imperative-verb action pattern in depth.
 - [Repositories](repositories.md) — the `<Model>RepositoryInterface` contract/implementation pair.
+- [Migrations & schema conventions](migrations.md) — table/column/migration-file naming and FK conventions.
 - [DTOs & value objects](dtos-value-objects.md) — naming and shaping immutable carriers.
 - [Code style](code-style.md) — `strict_types`, `final`, promotion, and the formatting rules these names sit inside.
 - [SOLID](solid.md) — why capability contracts and repository interfaces are named differently.

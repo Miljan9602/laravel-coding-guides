@@ -58,6 +58,7 @@ Dependencies point downward and are wired through **interfaces**.
 - [Services (reusable domain logic & integrations)](docs/services.md)
 - [Repositories — the only place models are touched](docs/repositories.md)
 - [Models & Eloquent](docs/models-eloquent.md)
+- [Migrations & schema conventions](docs/migrations.md)
 - [DTOs & value objects](docs/dtos-value-objects.md)
 - [Enums](docs/enums.md)
 

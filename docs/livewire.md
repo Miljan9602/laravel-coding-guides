@@ -9,6 +9,10 @@ Livewire components are a **thin UI layer**: they hold public state, validate in
 - **All reads go through Repositories** (often exposed as `#[Computed]` properties). Components never call `Model::query()` or `Model::where(...)` directly.
 - Get dependencies into a method one of **two safe ways**: method-inject into a *no-argument* action method (`save(SaveSettings $action)`), or resolve via `app(Interface::class)` *inside* the method when the method also takes JS-passed arguments.
 - **Never trust the request-scoped "current tenant" holder after `mount()`.** It is empty during Livewire AJAX update requests. Resolve the workspace once in `mount()` and store its **id** on the component.
+- **Lock every identity/authority property with `#[Locked]`.** Public properties are re-hydrated from the client payload on every update request; without `#[Locked]`, `$workspaceId`/`$reportId` are attacker-controlled (a textbook IDOR).
+- **`findOrFail($this->id)` does not scope by tenant.** It is a primary-key lookup with no workspace/user constraint; safe only when the id is `#[Locked]` *and* resolved from the authenticated user (prefer a `findForUserOrFail`-style repository method).
+- **Re-authorize inside every mutating method.** Route/Form-Request authorization runs only at the initial page load, never on `/livewire/update`; each `save()`/`delete()` calls `$this->authorize(...)` itself.
+- **Never put a secret or another tenant's records in a public property.** Public props serialize into the browser HTML; expose only the scalars the view needs.
 - Use `#[Computed]` for derived reads; they are memoized per request and keep Blade clean.
 - Use `wire:poll` plus an explicit pending/loading state for async job results.
 - Redirect with `redirectRoute(..., navigate: true)` to get SPA-style transitions.
@@ -52,7 +56,7 @@ use Livewire\Component;
 
 final class SettingsForm extends Component
 {
-    use ResolvesActiveWorkspace;
+    use InteractsWithWorkspace;
 
     #[Validate('required|string|max:120')]
     public string $displayName = '';
@@ -199,15 +203,18 @@ declare(strict_types=1);
 namespace App\Livewire\Concerns;
 
 use App\Support\Tenancy\TenantManager;
-use Illuminate\Validation\ValidationException;
+use Livewire\Attributes\Locked;
 
-trait ResolvesActiveWorkspace
+trait InteractsWithWorkspace
 {
     /**
      * The active workspace id, captured during mount() while the
-     * request-scoped tenant holder is still populated. Safe to read
-     * on every subsequent Livewire update request.
+     * request-scoped tenant holder is still populated. #[Locked] so
+     * Livewire rejects any client attempt to mutate it on a subsequent
+     * /livewire/update request — without this attribute the id is
+     * re-hydrated from the browser payload and is attacker-controlled.
      */
+    #[Locked]
     public int $workspaceId = 0;
 
     public function bindActiveWorkspace(): void
@@ -250,10 +257,221 @@ public function save(SaveWorkspaceSettings $action): void
 }
 ```
 
-If you must re-fetch the full model inside a method, look it up by the stored id through the repository — which also re-asserts the scope:
+If you must re-fetch the full model inside a method, look it up by the stored id through the repository — but understand that **this lookup does not re-assert the tenant scope on its own**. `findOrFail($this->workspaceId)` is a primary-key-only query (`where id = ? limit 1`) with no workspace or user constraint. If `$workspaceId` is an *unlocked public property*, a crafted `/livewire/update` payload can set it to any other tenant's id and this call will happily return that tenant's record — a textbook IDOR. The lookup is only safe when `$workspaceId` is locked against client tampering (next section) **and** the action re-authorizes against the authenticated user. Resolve from the authenticated user, never from a client-supplied id:
 
 ```php
-$workspace = app(WorkspaceRepository::class)->findOrFail($this->workspaceId);
+// Safe only because $workspaceId is #[Locked] and resolved from auth in mount().
+$workspace = app(WorkspaceRepository::class)
+    ->findForUserOrFail(auth()->id(), $this->workspaceId);
+```
+
+## Lock server-authoritative state with `#[Livewire\Attributes\Locked]`
+
+### Rule: every identity or authority property is `#[Locked]`
+
+**Why — a public Livewire property is part of the request payload, not server state.** Livewire serializes every `public` property into the HTML it sends to the browser, and on every `/livewire/update` AJAX call it **re-hydrates those properties from the client payload** before running your method. That means a `public int $workspaceId` you carefully set from the authenticated tenant in `mount()` is, on the very next `wire:click`, whatever value the browser sends. An attacker opens dev-tools (or replays the request with `curl`) and rewrites `workspaceId` to **another tenant's id**. Your `mount()` never re-runs on an update request, so nothing re-validates it — your `save()` happily writes to, and your `#[Computed]` happily reads from, a workspace the user has no claim to.
+
+`#[Livewire\Attributes\Locked]` closes this hole: Livewire records the property's value server-side and **throws a `CannotUpdateLockedPropertyException` if the incoming payload tries to change it**. Lock *every* property that names an identity or carries authority — `$workspaceId`, `$reportId`, `$contributorId`, `$deliveryChannelId`, `$githubInstallationId`, any role/permission flag. Form-input properties (`$displayName`, `$channel`) stay unlocked precisely *because* they are meant to come from the client; identity is not.
+
+✅ **Do** — identity is locked and resolved from the **authenticated user**, never the client value:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Livewire\Concerns;
+
+use App\Support\Tenancy\TenantManager;
+use Livewire\Attributes\Locked;
+
+trait InteractsWithWorkspace
+{
+    #[Locked]
+    public int $workspaceId = 0;
+
+    public function bindActiveWorkspace(): void
+    {
+        // Resolved server-side from the request-scoped tenant holder,
+        // which the middleware derives from the *authenticated* user —
+        // never from a property the browser can set.
+        $workspace = app(TenantManager::class)->current();
+
+        abort_if($workspace === null, 403, 'No active workspace for this request.');
+
+        $this->workspaceId = $workspace->id;
+    }
+}
+```
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Livewire\Reports;
+
+use App\Livewire\Concerns\InteractsWithWorkspace;
+use Livewire\Attributes\Locked;
+use Livewire\Component;
+
+final class ReportViewer extends Component
+{
+    use InteractsWithWorkspace;   // brings in #[Locked] public int $workspaceId
+
+    #[Locked]
+    public int $reportId = 0;     // identity → locked
+
+    public string $note = '';     // user input → intentionally unlocked
+
+    public function render(): \Illuminate\Contracts\View\View
+    {
+        return view('livewire.reports.report-viewer');
+    }
+}
+```
+
+❌ **Avoid** — the unlocked version, which is the IDOR:
+
+```php
+final class ReportViewer extends Component
+{
+    public int $workspaceId = 0;   // re-hydrated from the browser every update
+    public int $reportId = 0;      // attacker sets this to any report id
+
+    // On a crafted /livewire/update payload, $workspaceId and $reportId
+    // arrive as whatever the client chose. findForWorkspace() then returns
+    // — and addNote() then mutates — another tenant's report.
+    public function addNote(): void
+    {
+        app(ReportRepository::class)
+            ->findForWorkspace($this->workspaceId, $this->reportId)
+            ->update(['note' => $this->note]);
+    }
+}
+```
+
+**Edge cases.**
+
+- `#[Locked]` only prevents the *client* from changing a property; your own server code may assign it freely (as `mount()` does). It is not `readonly`.
+- A locked property can still be *read* in the browser payload — it is **not** secret, only tamper-proof. Never put a secret in any public property, locked or not (see the next section's last rule).
+- `#[Locked]` is not a substitute for authorization. It guarantees the id is the one *you* set; it does **not** prove the current user may act on that id. You still re-authorize in every action — that is the next section.
+
+## Re-authorize inside every action; public props are client-readable
+
+### Rule: every mutating Livewire method calls `$this->authorize(...)` itself
+
+**Why — route and Form Request authorization never runs on a Livewire update.** The middleware stack, route `->can()` gates, and any Form Request `authorize()` execute exactly **once**, on the initial full-page `GET` that boots the component. Every subsequent `wire:click` / `wire:model` / `wire:poll` is a `POST` to the shared `/livewire/update` endpoint — it does **not** re-run your route's authorization, and there is no Form Request in the loop at all. So a method that mutated data on the strength of "the route already checked this" is, on the update request, **completely unauthorized**. Combined with client-rehydrated properties, that is how one user edits another's data.
+
+Treat each public method as its own entry point: **re-authorize at the top of every mutating method**, using a policy keyed off the authenticated user and the locked id. Validate user input with `$this->validate()`, then delegate the write to an Action — the Action stays the single tested code path, the component owns the gate.
+
+✅ **Do** — re-authorize in both `save()` and `delete()`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Livewire\Reports;
+
+use App\Actions\Reports\DeleteReport;
+use App\Actions\Reports\UpdateReportNote;
+use App\Data\ReportNoteData;
+use App\Livewire\Concerns\InteractsWithWorkspace;
+use App\Repositories\Contracts\ReportRepository;
+use Livewire\Attributes\Locked;
+use Livewire\Attributes\Validate;
+use Livewire\Component;
+
+final class ReportEditor extends Component
+{
+    use InteractsWithWorkspace;
+
+    #[Locked]
+    public int $reportId = 0;
+
+    #[Validate('required|string|max:2000')]
+    public string $note = '';
+
+    public function mount(int $reportId): void
+    {
+        $this->bindActiveWorkspace();
+        $this->reportId = $reportId;
+
+        $report = app(ReportRepository::class)
+            ->findForWorkspaceOrFail($this->workspaceId, $this->reportId);
+
+        $this->authorize('update', $report);   // gate at load, too
+        $this->note = $report->note ?? '';
+    }
+
+    public function save(UpdateReportNote $action): void
+    {
+        $report = app(ReportRepository::class)
+            ->findForWorkspaceOrFail($this->workspaceId, $this->reportId);
+
+        $this->authorize('update', $report);   // re-checked on this update request
+        $this->validate();
+
+        $action->handle(
+            $this->workspaceId,
+            $this->reportId,
+            new ReportNoteData(note: $this->note),
+        );
+
+        session()->flash('status', 'Note saved.');
+    }
+
+    public function delete(DeleteReport $action): void
+    {
+        $report = app(ReportRepository::class)
+            ->findForWorkspaceOrFail($this->workspaceId, $this->reportId);
+
+        $this->authorize('delete', $report);   // its own gate; delete ≠ update
+
+        $action->handle($this->workspaceId, $this->reportId);
+
+        $this->redirectRoute('reports.index', navigate: true);
+    }
+
+    public function render(): \Illuminate\Contracts\View\View
+    {
+        return view('livewire.reports.report-editor');
+    }
+}
+```
+
+❌ **Avoid** — trusting the page-load check and skipping re-authorization on the update:
+
+```php
+public function delete(DeleteReport $action): void
+{
+    // No authorize() here. The route gate that ran on the initial GET does
+    // NOT run for this /livewire/update POST, so any authenticated user who
+    // can reach the component can delete this report. Pairing this with an
+    // unlocked $reportId lets them delete *any* report.
+    $action->handle($this->workspaceId, $this->reportId);
+}
+```
+
+**Never store secrets — or another tenant's records — in a public property.** Public properties serialize into the HTML delivered to the browser, so anything you assign to one is readable by the user (and tamperable unless `#[Locked]`). A `GithubInstallation` access token, a `DeliveryChannel` webhook secret, the raw `WorkspaceReportContext`, or a `Collection` of some *other* workspace's `ContributorSummary` records all leak the instant they touch a public property. Keep secrets in `config()`/the server-side context and out of the component; expose only the scalars the view actually needs.
+
+✅ **Do** — keep the secret server-side, surface only a derived boolean:
+
+```php
+#[Computed]
+public function slackConnected(): bool
+{
+    // Repository reads the token server-side and never returns it.
+    return app(DeliveryChannelRepository::class)
+        ->hasActiveSlack($this->workspaceId);
+}
+```
+
+❌ **Avoid** — a secret on a public property:
+
+```php
+public string $slackWebhookSecret = '';   // serialized straight into the page HTML
 ```
 
 ## Computed properties for derived reads
@@ -343,7 +561,7 @@ use Livewire\Component;
 
 final class Generator extends Component
 {
-    use \App\Livewire\Concerns\ResolvesActiveWorkspace;
+    use \App\Livewire\Concerns\InteractsWithWorkspace;
 
     public ?int $reportId = null;
 
@@ -526,7 +744,7 @@ declare(strict_types=1);
 namespace App\Livewire\Workspace;
 
 use App\Actions\Slack\ConnectSlackChannel;
-use App\Livewire\Concerns\ResolvesActiveWorkspace;
+use App\Livewire\Concerns\InteractsWithWorkspace;
 use App\Repositories\Contracts\SlackChannelRepository;
 use Illuminate\Support\Collection;
 use Livewire\Attributes\Computed;
@@ -535,7 +753,7 @@ use Livewire\Component;
 
 final class SlackChannels extends Component
 {
-    use ResolvesActiveWorkspace;
+    use InteractsWithWorkspace;
 
     #[Validate('required|string|starts_with:#|max:80')]
     public string $channel = '';
@@ -673,5 +891,7 @@ Reserve browser-level tests (Dusk / Livewire's browser testing) for genuinely JS
 ## See also
 
 - [Actions](actions.md) — where every write lives; components call them, never duplicate them.
-- [Repositories](repositories.md) — the only place components read data from.
+- [Repositories](repositories.md) — the only place components read data from; add a tenant-scoped `findForWorkspaceOrFail`/`findForUserOrFail` rather than a bare `findOrFail`.
+- [Controllers](controllers.md) — why route/Form-Request authorization runs only at page load and must be re-asserted on every Livewire update.
+- [Error handling](error-handling.md) — how `AuthorizationException` and `CannotUpdateLockedPropertyException` surface and the 403 you should expect.
 - [Testing](testing.md) — Pest conventions, fakes, and the `Livewire::test()` patterns above.

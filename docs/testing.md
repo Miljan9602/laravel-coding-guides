@@ -14,6 +14,9 @@ Tests are not a follow-up task — they are part of "done." A change without tes
 - **Stay DRY** with factories and small local helper functions — never copy-paste 15 lines of setup into ten tests.
 - **Bind fakes** via `$this->app->instance(Interface::class, $fake)` or `Mockery::mock(Interface::class)`; never `new` the system-under-test's dependencies by hand when the container can wire them.
 - **Force the deterministic fallback** by leaving AI keys blank in `config` — assert the template path renders without any HTTP stub.
+- **Encode the architecture as `arch()` tests** in `tests/Arch.php` so the headline rules (`final`, `declare(strict_types=1)`, the repository boundary) are checked by the suite, not by hope. A broken boundary fails `composer check`, i.e. CI.
+- **Run the arch presets** (`->preset()->php()`, `->security()`, `->laravel()`) as the baseline, then layer our project-specific expectations on top.
+- **Pin the repository boundary** with `expect('App\Models')->toOnlyBeUsedIn([...])` and forbid `DB`/`Http`/`Crypt` facades in controllers — the rule the prose states becomes a failing test the moment someone violates it.
 
 ## Use Pest, and structure with Arrange–Act–Assert
 
@@ -600,6 +603,145 @@ it('renders the deterministic template summary when no AI keys are set', functio
 
 Note we set configuration with `config()->set(...)`, never by mutating `env`. Production code reads `config('digest.ai.anthropic.key')`, so overriding the config value is what actually changes the code path under test. Because `Http::preventStrayRequests()` is active and no fake is registered, any accidental outbound call fails the test — which is the assertion that the fallback truly stays offline.
 
+## Enforce the architecture with Pest arch() tests
+
+### Why
+
+Most of our headline rules are not checked by anything that *fails*. Pint reformats style but does not assert that every concrete class is `final`; PHPStan type-checks but does not know "Eloquent models may only be touched inside repositories"; the rest is human review. The other pages in this guide quietly admit it — `final` is added "by hand, review checks it." That means the rules rot the instant someone forgets: a new model gets queried straight from a controller, a DTO is created mutable, a class ships non-`final`, and nothing goes red. The boundary is real only if a machine guards it.
+
+Pest's `arch()` API turns architectural rules into ordinary test expectations that run in the normal suite. `tests/Arch.php` is collected by Pest like any other test file, so it executes under `composer test` — and therefore under `composer check` (which is `lint:test` + `test`) and therefore in CI on every push and PR. A violated boundary is no longer a review nit you might miss; it is a red build with the offending class named in the failure. This is the cheapest, highest-leverage test we write: a handful of expectations that protect every rule the rest of this guide describes.
+
+### How — `tests/Arch.php`
+
+Map each expectation to a rule we already state elsewhere. Start from the bundled presets as a baseline, then add our project-specific boundaries:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+// --- Baseline presets -------------------------------------------------------
+// php(): no debug functions, always-strict comparisons, etc.
+// security(): no eval, no insecure randomness, no extract().
+// laravel(): Laravel's own structural conventions.
+arch()->preset()->php();
+arch()->preset()->security();
+arch()->preset()->laravel();
+
+// --- strict_types in every file --------------------------------------------
+arch('strict types everywhere')
+    ->expect('App')
+    ->toUseStrictTypes();
+
+// --- Every concrete class is final -----------------------------------------
+// Interfaces and abstract bases are excluded automatically.
+arch('all classes are final')
+    ->expect('App')
+    ->classes()
+    ->toBeFinal();
+
+// --- DTOs and value objects are immutable ----------------------------------
+arch('DTOs are readonly')
+    ->expect('App\Data')
+    ->toBeReadonly();
+
+arch('support value objects are readonly')
+    ->expect('App\Support\WorkspaceReportContext')
+    ->toBeReadonly();
+
+// --- The repository boundary: Eloquent models only inside repositories ------
+// This is the single most important rule on the Repositories page, made
+// executable. If a controller, action, service, Livewire component, or job
+// references App\Models\* directly, this expectation fails by name.
+arch('models are only used inside repositories')
+    ->expect('App\Models')
+    ->toOnlyBeUsedIn([
+        'App\Models',          // relationship definitions reference siblings
+        'App\Repositories',    // the only data-access seam
+        'App\Filament',        // framework-bound resource declarations
+        'Database\Factories',
+        'Database\Seeders',
+    ]);
+
+// --- Controllers stay thin: no infrastructure facades ----------------------
+arch('controllers do not touch infrastructure facades')
+    ->expect('App\Http\Controllers')
+    ->not->toUse([
+        'Illuminate\Support\Facades\DB',
+        'Illuminate\Support\Facades\Http',
+        'Illuminate\Support\Facades\Crypt',
+    ]);
+
+// --- Actions: one imperative unit of work ----------------------------------
+// Every Action exposes exactly one public entry point (handle() or __invoke).
+arch('actions expose a single public method')
+    ->expect('App\Actions')
+    ->toHaveMethod('handle');
+
+// --- Form Requests live where the framework resolves them ------------------
+arch('form requests are namespaced correctly')
+    ->expect('App\Http\Requests')
+    ->toExtend('Illuminate\Foundation\Http\FormRequest');
+
+// --- No stray debugging shipped to production ------------------------------
+arch('no debug statements')
+    ->expect(['dd', 'dump', 'ray', 'var_dump', 'vd'])
+    ->not->toBeUsed();
+```
+
+Each block reads as the rule it enforces. `toUseStrictTypes()` is the executable form of "`declare(strict_types=1)` in every file." `classes()->toBeFinal()` replaces "added by hand, review checks it." `expect('App\Data')->toBeReadonly()` pins the DTO rule. The `toOnlyBeUsedIn(...)` block is the repository boundary written as a test: the allowed list is *exactly* the namespaces where Eloquent is sanctioned (repository implementations, model relationship definitions, Filament's framework-bound resources, factories, and seeders) — anything else referencing `App\Models\*` turns the build red and prints the file.
+
+### How — why it runs in CI for free
+
+`tests/Arch.php` needs no special wiring. Pest discovers it alongside `tests/Unit` and `tests/Feature`, so:
+
+```bash
+./vendor/bin/pest          # runs Arch.php with the rest
+composer test              # config:clear + artisan test → includes Arch.php
+composer check             # lint:test + test → arch failures fail the gate
+```
+
+Because `composer check` is exactly what CI runs on push and PR (see [Tooling & CI](tooling-and-ci.md)), a violated boundary cannot merge. The day someone queries `App\Models\Report` from a controller, the `arch('models are only used inside repositories')` expectation fails with the controller named — long before review, and impossible to wave through. That is the whole point: the architecture stops being documentation and becomes a test.
+
+✅ Do — let the arch test catch the violation:
+
+```php
+// app/Http/Controllers/ReportController.php — this makes Arch.php go red:
+public function show(Workspace $workspace, int $reportId): View
+{
+    $report = Report::findOrFail($reportId); // App\Models\Report used outside a repository
+
+    return view('reports.show', ['report' => $report]);
+}
+```
+
+❌ Avoid — silencing the rule by widening `toOnlyBeUsedIn` to "fix" the failure:
+
+```php
+// Adding 'App\Http\Controllers' to the allowed list does not fix anything —
+// it deletes the rule. The boundary exists so controllers go through a
+// repository; route the access through ReportRepositoryInterface instead.
+->toOnlyBeUsedIn([
+    'App\Models',
+    'App\Repositories',
+    'App\Http\Controllers', // ← wrong: this re-opens the boundary you meant to close
+]);
+```
+
+The correct fix for a red arch test is to move the code to the right side of the boundary, not to broaden the boundary. See [Repositories](repositories.md) for where the data access belongs.
+
+### Edge cases
+
+- **Enums and interfaces are not "classes" for `toBeFinal()`.** `->classes()` already excludes interfaces, abstract classes, traits, and enums, so the `final` expectation does not false-positive on them. String-backed enums are governed by their own preset rules, not this one.
+- **Models and Livewire components are deliberately *not* `readonly`.** They carry mutable state by design, so `toBeReadonly()` is scoped to `App\Data` (and named value objects like `WorkspaceReportContext`), never to `App\Models` or `App\Livewire`. Do not widen the readonly expectation to `App`.
+- **Invokable Actions.** Some Actions use `__invoke()` rather than `handle()`. If you have both styles, assert with `->toHaveMethod('handle')->ignoring([...])` for the invokable ones, or split the expectation by sub-namespace — keep the rule honest rather than deleting it.
+- **The `laravel` preset can be opinionated.** If a baseline preset expectation conflicts with a documented project decision, narrow it with `->ignoring(...)` and leave a comment explaining *which* of our rules justifies the exclusion — never blanket-disable a whole preset.
+
+### Nice-to-haves alongside arch()
+
+- **Datasets** keep boundary-style tests DRY: `it('rejects invalid lookback')->with([0, -1, 366])` runs one body across many inputs instead of copy-pasting `it()` blocks — ideal for validation and parser edge cases.
+- **`$this->freezeTime()`** (or `travelTo()`) pins "now" so anything time-dependent — the per-minute `reports:dispatch` window, `PruneStaleReports` cutoffs, `generated_at` assertions — is deterministic instead of racing the wall clock.
+
 ## Gotchas that have actually bitten us
 
 ### `Http::fake()` called twice in the same test does NOT override the first stub
@@ -690,5 +832,6 @@ In tests this bites hardest with `assertDatabaseHas` passing while an in-memory 
 
 ## See also
 
-- [Repositories](repositories.md) — the data-access seam that consumers fake in unit tests.
+- [Repositories](repositories.md) — the data-access seam that consumers fake in unit tests, and the boundary the `toOnlyBeUsedIn` arch test enforces.
+- [Tooling & CI](tooling-and-ci.md) — how `composer check` runs `tests/Arch.php` on every push and PR, so a broken boundary fails the build.
 - [Jobs, Commands & Scheduling](jobs-commands-scheduling.md) — what `Queue::fake()`, `dispatchSync()`, and `app()->call([$job, 'handle'])` are testing.

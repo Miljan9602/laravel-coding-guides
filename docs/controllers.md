@@ -13,6 +13,9 @@ A controller is HTTP glue: it receives a validated request, hands the work to ex
 - Prefer **invokable single-action controllers** (`__invoke`) for one-off endpoints; use **resource controllers** for standard CRUD.
 - Inject dependencies you need on every method via the **constructor**; inject per-method collaborators as **method parameters** (Laravel resolves both from the container).
 - Always declare an **explicit return type** (`RedirectResponse`, `JsonResponse`, `View`, `Response`).
+- Every API/JSON response goes through a **`JsonResource`** — never serialise a raw model, an array, or `$model->toArray()` straight to the client.
+- When a route model belongs to **another tenant**, abort with **`404`, not `403`**, so you never confirm the resource exists to someone who may not see it.
+- Authorization is decided by a **Policy class** (auto-discovered), invoked from a Form Request's `authorize()` or `$this->authorize()` — never a hand-rolled `abort_unless($user->can(...), 403)` in the controller body.
 - A controller method should read top-to-bottom in a handful of lines. If it doesn't, the logic is in the wrong place.
 
 ## Why controllers stay skinny
@@ -538,8 +541,331 @@ public function store(StoreReportRequest $request, RunReport $runReport)
 
 Use the precise type: `RedirectResponse`, `JsonResponse`, `View`, `StreamedResponse`, or `Response`. Reach for the union `View|RedirectResponse` only when a method genuinely returns either, and prefer splitting the endpoint if that branch encodes a business decision.
 
+## Shape responses with API Resources
+
+A model is your storage shape; an API response is your public contract. The two diverge the moment you add an internal column (`webhook_secret`, `installation_token`), rename a field, or want to expose a computed value. An **API Resource** — an `Illuminate\Http\Resources\Json\JsonResource` subclass — is the transformation layer that sits between them: it takes a model (or collection) and returns exactly the JSON you mean to ship. Serialising a raw model leaks every `$fillable`/`$visible` column you forget to hide, couples the wire format to the table, and turns a migration into a breaking API change. The Resource decouples them: the column rename is one line in `toArray()`, the contract is unchanged.
+
+> A `JsonResource` is the **HTTP** API Resource — not a Filament Resource. Filament's `Resource` (`app/Filament/Resources/*`) is an admin-panel CRUD declaration; the `JsonResource` here (`app/Http/Resources/*`) is the JSON serialiser for your public endpoints. Different layers, unrelated base classes; see [Filament](filament.md).
+
+The rule: **every JSON response renders through a `JsonResource`**. Never return `$model`, `$model->toArray()`, or a hand-built array from a JSON endpoint.
+
+### ✅ Do — a Resource owns the wire shape
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Http\Resources;
+
+use App\Models\Report;
+use Illuminate\Http\Request;
+use Illuminate\Http\Resources\Json\JsonResource;
+
+/**
+ * @mixin Report
+ */
+final class ReportResource extends JsonResource
+{
+    /**
+     * @return array<string, mixed>
+     */
+    public function toArray(Request $request): array
+    {
+        return [
+            'id' => $this->id,
+            'type' => $this->type->value,
+            'period_start' => $this->period_start->toIso8601String(),
+            'period_end' => $this->period_end->toIso8601String(),
+            'status' => $this->status->value,
+            // Relationship is only serialised when the caller eager-loaded it.
+            'contributors' => ContributorSummaryResource::collection(
+                $this->whenLoaded('contributorSummaries'),
+            ),
+            // Permission-gated field: present only for workspace admins.
+            'delivery_log' => $this->when(
+                $request->user()?->can('viewDeliveryLog', $this->resource) ?? false,
+                fn (): array => $this->delivery_log,
+            ),
+        ];
+    }
+}
+```
+
+The controller stays a one-liner, with a `JsonResponse` return type:
+
+```php
+public function show(Report $report): JsonResource
+{
+    $this->authorize('view', $report);
+
+    return ReportResource::make($report->load('contributorSummaries'));
+}
+```
+
+Return the `JsonResource` directly — Laravel serialises it to a `JsonResponse` for you (declaring `JsonResource` as the return type is honest about what the method produces; wrapping in `response()->json(ReportResource::make(...))` is equivalent and also fine). Either way, **the model never reaches `response()->json()` unwrapped.**
+
+### ❌ Avoid — serialising the model straight to JSON
+
+```php
+public function show(Report $report): JsonResponse
+{
+    // Ships every column: status, internal flags, and any future secret column
+    // someone adds to the table — silently, the day they add it.
+    return response()->json($report);
+}
+
+public function index(WorkspaceReportsQuery $reports): JsonResponse
+{
+    // ->toArray() has the identical leak, plus an N+1 if the view touches relations.
+    return response()->json($reports->forCurrentWorkspace()->get()->toArray());
+}
+```
+
+`response()->json($report)` makes the table the contract. Add a column, leak a column. Hide it with `$hidden` and you have now coupled the model's serialisation to one endpoint's needs — the next endpoint that *does* want that column can't have it. The Resource is where each endpoint states its own shape.
+
+### `whenLoaded`, `when`, `mergeWhen` — conditional keys
+
+Three conditionals keep a Resource both safe and cheap:
+
+- **`whenLoaded('relation')`** — include a relationship's data **only if it was eager-loaded**. This is your N+1 guard inside the Resource: if the relation isn't loaded, the key is omitted entirely rather than triggering a lazy query per row. Pair it with an explicit `->load()` / `->with()` at the call site so the eager-load is a deliberate decision, not an accident.
+- **`when($condition, $value)`** — include a key only when a condition holds, typically a permission gate. Pass a **closure** for `$value` when computing it is non-trivial, so it runs only when the condition is true.
+- **`mergeWhen($condition, [...])`** — merge several keys at once behind one condition, e.g. an admin-only block of operational fields.
+
+```php
+return [
+    'id' => $this->id,
+    'period_end' => $this->period_end->toIso8601String(),
+    // N+1-safe: only serialised when ->load('contributorSummaries') ran.
+    'contributors' => ContributorSummaryResource::collection(
+        $this->whenLoaded('contributorSummaries'),
+    ),
+    // Admin-only operational block, gated once.
+    ...$this->mergeWhen($request->user()?->can('administer', $this->resource) ?? false, [
+        'delivery_log' => $this->delivery_log,
+        'last_dispatched_at' => $this->last_dispatched_at?->toIso8601String(),
+    ]),
+];
+```
+
+Use `ReportResource::collection($reports)` for lists (it wraps each item and handles pagination metadata). Eager-load the relations the Resource references **before** you hand the models over — `whenLoaded` protects you from N+1 only if you never lazy-load in the first place.
+
+## Tenant-scoped routes: 404, not 403
+
+Every route-bound model in a multi-tenant app must be proven to belong to the **current** workspace before the controller acts on it. The interesting question is what to do when it doesn't. The instinct is `403 Forbidden`. The correct answer is almost always `404 Not Found`.
+
+A `403` is an admission: *"this resource exists, you just can't have it."* That single bit leaks existence. An attacker who can tell `403` (exists, not yours) from `404` (doesn't exist) can **enumerate** your resources — walk `/reports/1`, `/reports/2`, … and map out which IDs are live across other tenants, how many reports a competitor runs, when one appeared. For anything scoped to a tenant the safest posture is to make "not yours" and "doesn't exist" **indistinguishable**: return `404` for both. The caller learns nothing they didn't already know.
+
+### ✅ Do — cross-tenant access is a 404
+
+```php
+public function show(Report $report): JsonResource
+{
+    // Belongs to another workspace → behave exactly as if it never existed.
+    abort_unless($report->workspace_id === $request->workspace()->getKey(), 404);
+
+    return ReportResource::make($report->load('contributorSummaries'));
+}
+```
+
+At the policy level, return the same `404` instead of a bare denial. `Illuminate\Auth\Access\Response::denyAsNotFound()` produces a denial that the framework renders as `404` rather than the default `403`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Policies;
+
+use App\Models\Report;
+use App\Models\User;
+use Illuminate\Auth\Access\Response;
+
+final class ReportPolicy
+{
+    public function view(User $user, Report $report): Response
+    {
+        return $report->workspace_id === $user->current_workspace_id
+            ? Response::allow()
+            // Same 404 a missing report would return — existence is never confirmed.
+            : Response::denyAsNotFound();
+    }
+}
+```
+
+Now both `$this->authorize('view', $report)` and a Form Request's `authorize()` produce a `404` for a cross-tenant report, with no special-casing in the controller.
+
+### ❌ Avoid — leaking existence with a 403
+
+```php
+public function show(Report $report): JsonResource
+{
+    // 403 confirms the report exists and belongs to someone else — enumerable.
+    abort_unless($report->workspace_id === $request->workspace()->getKey(), 403);
+
+    return ReportResource::make($report);
+}
+```
+
+**Edge cases.** A genuine *permission* failure within the user's own tenant — a member trying an admin-only action on a report they can legitimately see — is a real `403`; they already know the resource exists, so hiding it serves nothing. Reserve `404`-for-authorization for the **cross-tenant boundary**, where existence itself is the secret. The same `abort_unless(..., 404)` guard appears in [error handling](error-handling.md); this section is the *why* behind it.
+
+## Authorization: policy classes & `Gate::before`
+
+Scattered `if ($user->role === 'admin')` checks rot: the rule for "who may delete a report" ends up copied into a controller, a Livewire component, and a Blade `@can`, and they drift. A **Policy** centralises every authorization decision for one model into one class with one method per ability. Every layer then asks the same question the same way — `$user->can('delete', $report)`, `$this->authorize('delete', $report)`, `@can('delete', $report)`, a Form Request's `authorize()` — and gets the same answer.
+
+### A real Policy
+
+Map one ability method per action. `viewAny` and `create` take no model (there is none yet); `view`, `update`, and `delete` receive the resolved model.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Policies;
+
+use App\Models\Report;
+use App\Models\User;
+use Illuminate\Auth\Access\Response;
+
+final class ReportPolicy
+{
+    public function viewAny(User $user): bool
+    {
+        return $user->current_workspace_id !== null;
+    }
+
+    public function view(User $user, Report $report): Response
+    {
+        return $report->workspace_id === $user->current_workspace_id
+            ? Response::allow()
+            : Response::denyAsNotFound();
+    }
+
+    public function create(User $user): bool
+    {
+        return $user->isAdminOf($user->current_workspace_id);
+    }
+
+    public function update(User $user, Report $report): bool
+    {
+        return $report->workspace_id === $user->current_workspace_id
+            && $user->isAdminOf($report->workspace_id);
+    }
+
+    public function delete(User $user, Report $report): Response
+    {
+        return $report->workspace_id === $user->current_workspace_id
+            ? Response::allow()
+            : Response::denyAsNotFound();
+    }
+}
+```
+
+**Auto-discovery.** Laravel maps `App\Models\Report` to `App\Policies\ReportPolicy` by naming convention — no registration needed as long as the names line up. Override only if a policy lives off-convention, via `Gate::policy(Report::class, ReportPolicy::class)` in a service provider.
+
+**`authorizeResource` wires a resource controller in one call.** It registers `before`-style middleware mapping each resource method to its ability (`index → viewAny`, `show → view`, `store → create`, `update → update`, `destroy → delete`), so you delete the per-method `$this->authorize(...)` calls:
+
+```php
+final class ReportController extends Controller
+{
+    public function __construct()
+    {
+        // Every resource method now runs its matching policy ability automatically.
+        $this->authorizeResource(Report::class, 'report');
+    }
+
+    public function show(Report $report): JsonResource
+    {
+        // No $this->authorize('view', $report) needed — authorizeResource did it.
+        return ReportResource::make($report->load('contributorSummaries'));
+    }
+}
+```
+
+The route parameter name (`'report'`) must match the model binding (`Report $report`) for the implicit-model methods to resolve the right instance.
+
+### `Gate::before` — grant super-admin once
+
+A `Gate::before` callback runs **before every policy check** and short-circuits the lot: return `true` and the ability is granted regardless of the policy. This is the one clean place to encode a global super-admin so the rule lives in exactly one spot instead of being threaded through every policy method.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+namespace App\Providers;
+
+use App\Models\User;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Support\ServiceProvider;
+
+final class AuthServiceProvider extends ServiceProvider
+{
+    public function boot(): void
+    {
+        // Super-admins bypass every policy. Returning null falls through to the
+        // policy; only an explicit bool decides the ability here.
+        Gate::before(function (User $user, string $ability): ?bool {
+            return $user->is_super_admin ? true : null;
+        });
+    }
+}
+```
+
+Today `is_super_admin` is hand-checked only in Filament's `canAccessPanel()`. Centralising it in `Gate::before` means a super-admin transparently passes every `can`/`authorize`/`@can` across the app, with the grant defined once. Return **`null`** (not `false`) for the non-super-admin case — `false` would *deny* the ability outright and skip the policy, whereas `null` lets the policy decide.
+
+> **Footgun.** `Gate::before` is **skipped for any ability whose policy class lacks a matching method.** If `ReportPolicy` has no `export` method and you call `$user->can('export', $report)`, Laravel never reaches `before` — the check just fails. A super-admin you "granted everything" will be denied an ability the policy doesn't define. Either define the method on the policy or use a `Gate::define('export', ...)` ability so `before` has something to intercept.
+
+### Keep the controller thin
+
+Authorization is a *decision*, and like every decision it leaves the controller body. Host it in the Form Request's `authorize()` when one exists, or `$this->authorize()` (directly or via `authorizeResource`) when there isn't. The controller never hand-rolls `abort_unless($user->can(...), 403)`.
+
+### ✅ Do — authorize in the Form Request, controller stays glue
+
+```php
+final class DeleteReportRequest extends FormRequest
+{
+    public function authorize(): bool
+    {
+        // Delegates to ReportPolicy::delete via the gate; fails closed → 403/404.
+        return $this->user()->can('delete', $this->route('report'));
+    }
+}
+```
+
+```php
+public function destroy(DeleteReportRequest $request, Report $report, ArchiveReport $archive): RedirectResponse
+{
+    // Authorization already happened in the Form Request. Just delegate.
+    $archive->handle($report);
+
+    return to_route('reports.index')->with('status', 'report-archived');
+}
+```
+
+### ❌ Avoid — inlining the permission check in the controller
+
+```php
+public function destroy(Report $report, ArchiveReport $archive): RedirectResponse
+{
+    // Authorization logic smeared into the controller body.
+    abort_unless($request->user()->can('delete', $report), 403);
+    abort_unless($report->workspace_id === $request->user()->current_workspace_id, 403);
+
+    $archive->handle($report);
+
+    return to_route('reports.index');
+}
+```
+
+Both checks belong in `ReportPolicy::delete` (which already encodes tenant scoping *and* the `404`-over-`403` choice), reached through the Form Request. The controller is left with one job: delegate and redirect. See [Form requests](form-requests.md) for `authorize()` and [Error handling](error-handling.md) for how failed authorization renders.
+
 ## See also
 
 - [Form requests](form-requests.md)
 - [Actions](actions.md)
 - [Repositories](repositories.md)
+- [Error handling](error-handling.md)
+- [Models & Eloquent](models-eloquent.md)
+- [Livewire](livewire.md)
